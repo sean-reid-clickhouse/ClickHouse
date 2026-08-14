@@ -13,6 +13,8 @@
 #include <Poco/JSON/Object.h>
 #include <Poco/JSON/Parser.h>
 #include <base/scope_guard.h>
+#include <filesystem>
+#include <tuple>
 
 
 namespace ProfileEvents
@@ -139,6 +141,7 @@ ObjectStorageQueueIFileMetadata::ObjectStorageQueueIFileMetadata(
     size_t max_loading_retries_,
     std::atomic<size_t> & metadata_ref_count_,
     bool use_persistent_processing_nodes_,
+    const std::string & claim_owner_id_,
     LoggerPtr log_)
     : path(path_)
     , zookeeper_name(zookeeper_name_)
@@ -147,6 +150,7 @@ ObjectStorageQueueIFileMetadata::ObjectStorageQueueIFileMetadata(
     , max_loading_retries(max_loading_retries_)
     , metadata_ref_count(metadata_ref_count_)
     , use_persistent_processing_nodes(use_persistent_processing_nodes_)
+    , claim_owner_id(claim_owner_id_)
     , processing_node_path(processing_node_path_)
     , processed_node_path(processed_node_path_)
     , failed_node_path(failed_node_path_)
@@ -260,12 +264,15 @@ ObjectStorageQueueIFileMetadata::NodeMetadata ObjectStorageQueueIFileMetadata::c
     return metadata;
 }
 
-std::string ObjectStorageQueueIFileMetadata::getProcessorInfo(const std::string & processor_id)
+std::string ObjectStorageQueueIFileMetadata::getProcessorInfo(
+    const std::string & processor_id, const std::string & claim_owner_id)
 {
     /// Add information which will be useful for debugging just in case.
     Poco::JSON::Object json;
     json.set("hostname", DNSResolver::instance().getHostName());
     json.set("processor_id", processor_id);
+    if (!claim_owner_id.empty())
+        json.set("claim_owner_id", claim_owner_id);
 
     std::ostringstream oss; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
     oss.exceptions(std::ios::failbit);
@@ -317,10 +324,77 @@ bool ObjectStorageQueueIFileMetadata::trySetProcessing()
     ProfileEvents::increment(ProfileEvents::ObjectStorageQueueTrySetProcessingRequests);
 
     auto [success, file_state] = setProcessingImpl();
+    if (!success
+        && file_state == FileStatus::State::Processing
+        && tryRemoveStaleProcessingNode())
+    {
+        std::tie(success, file_state) = setProcessingImpl();
+    }
     afterSetProcessing(success, file_state);
 
     LOG_TEST(log, "File {} has state `{}`: will {}process", path, file_state, success ? "" : "not ");
     return success;
+}
+
+bool ObjectStorageQueueIFileMetadata::tryRemoveStaleProcessingNode()
+{
+    if (!use_persistent_processing_nodes || claim_owner_id.empty())
+        return false;
+
+    const auto queue_path = std::filesystem::path(processing_node_path).parent_path().parent_path();
+    const auto claim_owner_path = queue_path / "claim_owners" / claim_owner_id;
+    auto zk_retry = ObjectStorageQueueMetadata::getKeeperRetriesControl(log);
+
+    Coordination::Error code = {};
+    std::string previous_claim_owner_id;
+    zk_retry.retryLoop([&]
+    {
+        auto zk_client = ObjectStorageQueueMetadata::getZooKeeper(log, zookeeper_name);
+        Coordination::Stat stat;
+        std::string data;
+        if (!zk_client->tryGet(processing_node_path, data, &stat))
+        {
+            code = Coordination::Error::ZOK;
+            return;
+        }
+
+        Poco::JSON::Parser parser;
+        auto json = parser.parse(data).extract<Poco::JSON::Object::Ptr>();
+        previous_claim_owner_id = json->optValue<std::string>("claim_owner_id", "");
+        if (previous_claim_owner_id.empty() || previous_claim_owner_id == claim_owner_id)
+        {
+            code = Coordination::Error::ZNODEEXISTS;
+            return;
+        }
+
+        Coordination::Requests requests;
+        requests.push_back(zkutil::makeCheckRequest(claim_owner_path, -1));
+        zkutil::addCheckNotExistsRequest(requests, *zk_client, queue_path / "claim_owners" / previous_claim_owner_id);
+        requests.push_back(zkutil::makeRemoveRequest(processing_node_path, stat.version));
+
+        Coordination::Responses responses;
+        code = zk_client->tryMulti(requests, responses);
+    });
+
+    if (code == Coordination::Error::ZOK)
+    {
+        if (!previous_claim_owner_id.empty())
+        {
+            LOG_INFO(
+                log,
+                "Removed stale processing node {} owned by inactive claim owner {}",
+                processing_node_path,
+                previous_claim_owner_id);
+        }
+        return true;
+    }
+
+    if (code == Coordination::Error::ZNODEEXISTS
+        || code == Coordination::Error::ZNONODE
+        || code == Coordination::Error::ZBADVERSION)
+        return false;
+
+    throw zkutil::KeeperException::fromPath(code, processing_node_path);
 }
 
 std::optional<ObjectStorageQueueIFileMetadata::SetProcessingResponseIndexes>

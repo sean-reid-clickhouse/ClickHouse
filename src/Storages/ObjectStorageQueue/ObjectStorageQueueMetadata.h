@@ -130,7 +130,8 @@ public:
     /// allows to manage metadata of a concrete file.
     FileMetadataPtr getFileMetadata(
         const std::string & path,
-        ObjectStorageQueueOrderedFileMetadata::BucketInfoPtr bucket_info = {});
+        ObjectStorageQueueOrderedFileMetadata::BucketInfoPtr bucket_info = {},
+        const std::string & claim_owner_id = {});
 
     /// Register table in keeper metadata.
     /// active = false:
@@ -147,10 +148,12 @@ public:
     ///     For this we create ephemeral nodes in "zookeeper_path / registry / <node_info>"
     void registerNonActive(const StorageID & storage_id, bool & created_new_metadata);
     void registerActive(const StorageID & storage_id);
+    void registerClaimOwner(const StorageID & storage_id);
 
     /// Unregister table.
     /// Return the number of remaining (after unregistering) registered tables.
     void unregisterActive(const StorageID & storage_id);
+    void unregisterClaimOwner(const StorageID & storage_id);
     void unregisterNonActive(const StorageID & storage_id, bool remove_metadata_if_no_registered);
     Strings getRegistered(bool active);
 
@@ -173,7 +176,10 @@ public:
         ObjectStorageQueuePartitioningMode partitioning_mode,
         const ObjectStorageQueueFilenameParser * parser);
     /// Acquire (take unique ownership of) bucket for processing.
-    ObjectStorageQueueOrderedFileMetadata::BucketHolderPtr tryAcquireBucket(const Bucket & bucket);
+    ObjectStorageQueueOrderedFileMetadata::BucketHolderPtr tryAcquireBucket(
+        const Bucket & bucket, const std::string & claim_owner_id);
+
+    std::string getClaimOwnerID(const StorageID & storage_id) const;
 
     const String & getZooKeeperName() const { return zookeeper_name; }
     std::shared_ptr<ZooKeeperWithFaultInjection> getZooKeeper() const { return getZooKeeper(log, zookeeper_name); }
@@ -209,7 +215,6 @@ private:
     void updateRegistryFunc();
     void updateRegistry(const DB::Strings & registered_);
 
-    /// Get ID for the specified table which is used for active tables.
     static std::string getProcessorID(const StorageID & storage_id);
 
     ObjectStorageQueueTableMetadata table_metadata;

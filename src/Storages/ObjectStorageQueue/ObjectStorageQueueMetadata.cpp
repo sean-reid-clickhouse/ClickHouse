@@ -24,6 +24,7 @@
 #include <Interpreters/DDLTask.h>
 #include <shared_mutex>
 #include <Core/ServerUUID.h>
+#include <Core/UUID.h>
 
 
 namespace ProfileEvents
@@ -229,7 +230,8 @@ void ObjectStorageQueueMetadata::shutdown()
 
 ObjectStorageQueueMetadata::FileMetadataPtr ObjectStorageQueueMetadata::getFileMetadata(
     const std::string & path,
-    ObjectStorageQueueOrderedFileMetadata::BucketInfoPtr bucket_info)
+    ObjectStorageQueueOrderedFileMetadata::BucketInfoPtr bucket_info,
+    const std::string & claim_owner_id)
 {
     chassert(metadata_ref_count);
     auto [file_status, _] = local_file_statuses.getOrSet(
@@ -249,6 +251,7 @@ ObjectStorageQueueMetadata::FileMetadataPtr ObjectStorageQueueMetadata::getFileM
                 table_metadata.loading_retries,
                 *metadata_ref_count,
                 use_persistent_processing_nodes,
+                claim_owner_id,
                 zookeeper_name,
                 bucketing_mode,
                 partitioning_mode,
@@ -262,6 +265,7 @@ ObjectStorageQueueMetadata::FileMetadataPtr ObjectStorageQueueMetadata::getFileM
                 table_metadata.loading_retries,
                 *metadata_ref_count,
                 use_persistent_processing_nodes,
+                claim_owner_id,
                 zookeeper_name,
                 log);
     }
@@ -323,10 +327,16 @@ std::optional<std::string> ObjectStorageQueueMetadata::getStartAfterForListing()
 }
 
 ObjectStorageQueueOrderedFileMetadata::BucketHolderPtr
-ObjectStorageQueueMetadata::tryAcquireBucket(const Bucket & bucket)
+ObjectStorageQueueMetadata::tryAcquireBucket(const Bucket & bucket, const std::string & claim_owner_id)
 {
     return ObjectStorageQueueOrderedFileMetadata::tryAcquireBucket(
-        zookeeper_path, bucket, use_persistent_processing_nodes, persistent_processing_node_ttl_seconds, zookeeper_name, log);
+        zookeeper_path,
+        bucket,
+        claim_owner_id,
+        use_persistent_processing_nodes,
+        persistent_processing_node_ttl_seconds,
+        zookeeper_name,
+        log);
 }
 
 void ObjectStorageQueueMetadata::alterSettings(const SettingsChanges & changes, const ContextPtr & context)
@@ -617,6 +627,7 @@ ObjectStorageQueueTableMetadata ObjectStorageQueueMetadata::syncWithKeeper(
                     table_metadata.loading_retries,
                     noop,
                     /* use_persistent_processing_nodes */false, /// Processing nodes will not be created.
+                    /* claim_owner_id */ "",
                     zookeeper_name,
                     table_metadata.getBucketingMode(),
                     table_metadata.getPartitioningMode(),
@@ -729,7 +740,42 @@ void ObjectStorageQueueMetadata::registerActive(const StorageID & storage_id)
         && code != Coordination::Error::ZNODEEXISTS)
         throw zkutil::KeeperException(code);
 
+    /// A newly created active entry means this is the first cycle after startup,
+    /// backoff, or Keeper session recovery. Recreate the lifetime claim owner as well.
+    if (code == Coordination::Error::ZOK)
+    {
+        try
+        {
+            registerClaimOwner(storage_id);
+        }
+        catch (...)
+        {
+            Coordination::Error remove_code = {};
+            getKeeperRetriesControl(log).retryLoop([&] { remove_code = getZooKeeper()->tryRemove(table_path); });
+            if (remove_code != Coordination::Error::ZOK && remove_code != Coordination::Error::ZNONODE)
+                LOG_WARNING(log, "Failed to roll back active registry entry {}: {}", table_path, remove_code);
+            throw;
+        }
+    }
+
     LOG_TRACE(log, "Added {} to active registry ({})", self.table_id, id);
+}
+
+void ObjectStorageQueueMetadata::registerClaimOwner(const StorageID & storage_id)
+{
+    const auto owner_path = zookeeper_path / "claim_owners" / getClaimOwnerID(storage_id);
+    const auto self = Info::create(storage_id);
+
+    Coordination::Error code = {};
+    getKeeperRetriesControl(log).retryLoop([&]
+    {
+        auto zk_client = getZooKeeper();
+        zk_client->createAncestors(owner_path);
+        code = zk_client->tryCreate(owner_path, self.serialize(), zkutil::CreateMode::Ephemeral);
+    });
+
+    if (code != Coordination::Error::ZOK && code != Coordination::Error::ZNODEEXISTS)
+        throw zkutil::KeeperException::fromPath(code, owner_path);
 }
 
 void ObjectStorageQueueMetadata::registerNonActive(const StorageID & storage_id, bool & created_new_metadata)
@@ -868,6 +914,16 @@ void ObjectStorageQueueMetadata::unregisterActive(const StorageID & storage_id)
             Coordination::errorMessage(code),
             table_path);
     }
+}
+
+void ObjectStorageQueueMetadata::unregisterClaimOwner(const StorageID & storage_id)
+{
+    const auto owner_path = zookeeper_path / "claim_owners" / getClaimOwnerID(storage_id);
+    Coordination::Error code = {};
+    getKeeperRetriesControl(log).retryLoop([&] { code = getZooKeeper()->tryRemove(owner_path); });
+
+    if (code != Coordination::Error::ZOK && code != Coordination::Error::ZNONODE)
+        throw zkutil::KeeperException::fromPath(code, owner_path);
 }
 
 void ObjectStorageQueueMetadata::unregisterNonActive(const StorageID & storage_id, bool remove_metadata_if_no_registered)
@@ -1105,6 +1161,22 @@ private:
 std::string ObjectStorageQueueMetadata::getProcessorID(const StorageID & storage_id)
 {
     return toString(Info::create(storage_id).hash());
+}
+
+std::string ObjectStorageQueueMetadata::getClaimOwnerID(const StorageID & storage_id) const
+{
+    /// Claim-owner entries describe one lifetime of a server process. A stable server
+    /// UUID is not enough here: after a restart it would make a persistent claim left
+    /// by the old process appear to still have a live owner.
+    static const std::string process_instance_id = toString(UUIDHelpers::generateV4());
+
+    const auto info = Info::create(storage_id);
+    auto hash = SipHash();
+    hash.update(info.hostname);
+    hash.update(info.table_id);
+    hash.update(info.server_uuid);
+    hash.update(process_instance_id);
+    return toString(hash.get128());
 }
 
 void ObjectStorageQueueMetadata::filterOutForProcessor(Strings & paths, const StorageID & storage_id) const

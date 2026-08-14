@@ -101,6 +101,7 @@ ObjectStorageQueueSource::FileIterator::FileIterator(
     LoggerPtr logger_,
     bool enable_hash_ring_filtering_,
     bool file_deletion_on_processed_enabled_,
+    bool track_claim_owner_,
     std::atomic<bool> & shutdown_called_)
     : WithContext(context_)
     , metadata(metadata_)
@@ -112,6 +113,7 @@ ObjectStorageQueueSource::FileIterator::FileIterator(
     , mode(metadata->getTableMetadata().getMode())
     , enable_hash_ring_filtering(enable_hash_ring_filtering_)
     , storage_id(storage_id_)
+    , claim_owner_id(track_claim_owner_ ? metadata->getClaimOwnerID(storage_id) : "")
     , use_buckets_for_processing(metadata->useBucketsForProcessing())
     , buckets_num(use_buckets_for_processing ? metadata->getBucketsNum() : 0)
     , shutdown_called(shutdown_called_)
@@ -272,7 +274,8 @@ ObjectStorageQueueSource::FileIterator::next()
                 {
                     file_metadatas[i] = metadata->getFileMetadata(
                         new_batch[i]->getPath(),
-                        /* bucket_info */ {}); /// No buckets for Unordered mode.
+                        /* bucket_info */ {},
+                        claim_owner_id); /// No buckets for Unordered mode.
 
                     auto set_processing_result = file_metadatas[i]->prepareSetProcessingRequests(requests, processing_id);
                     if (set_processing_result.has_value())
@@ -381,9 +384,19 @@ ObjectStorageQueueSource::FileIterator::next()
                     ProfileEvents::increment(ProfileEvents::ObjectStorageQueueFailedToBatchSetProcessing);
 
                     auto failed_idx = zkutil::getFailedOpIndex(code, responses);
+                    const auto & failed_path = requests[failed_idx]->getPath();
 
                     LOG_TRACE(log, "Failed to set files as processing in one request: {} ({})",
-                              code, requests[failed_idx]->getPath());
+                              code, failed_path);
+
+                    for (const auto & file_metadata : file_metadatas)
+                    {
+                        if (file_metadata && file_metadata->getProcessingPath() == failed_path)
+                        {
+                            file_metadata->tryRemoveStaleProcessingNode();
+                            break;
+                        }
+                    }
 
                     file_metadatas.clear();
                 }
@@ -551,7 +564,7 @@ ObjectInfoPtr ObjectStorageQueueSource::FileIterator::next(size_t processor)
 
         if (!file_metadata)
         {
-            file_metadata = metadata->getFileMetadata(object_info->getPath(), bucket_info);
+            file_metadata = metadata->getFileMetadata(object_info->getPath(), bucket_info, claim_owner_id);
             if (!file_metadata->trySetProcessing())
                 continue;
         }
@@ -715,7 +728,7 @@ ObjectStorageQueueSource::BucketHolderPtr ObjectStorageQueueSource::FileIterator
             bucket_info.processor.value(), processor);
     }
 
-    auto holder = metadata->tryAcquireBucket(bucket);
+    auto holder = metadata->tryAcquireBucket(bucket, claim_owner_id);
     if (!holder)
     {
         LOG_TEST(log, "Bucket {} is already locked for processing (keys: {})", bucket, bucket_info.keys.size());

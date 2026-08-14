@@ -103,6 +103,7 @@ public:
         size_t max_loading_retries_,
         std::atomic<size_t> & metadata_ref_count_,
         bool use_persistent_processing_nodes_,
+        const std::string & claim_owner_id_,
         LoggerPtr log_);
 
     virtual ~ObjectStorageQueueIFileMetadata();
@@ -143,6 +144,8 @@ public:
 
     /// Try set file as Processing.
     bool trySetProcessing();
+    /// Remove a persistent processing claim whose claim owner is gone.
+    bool tryRemoveStaleProcessingNode();
     /// Reset processing
     /// (file will not be set neither as Failed nor Processed,
     /// simply Processing state will be cancelled).
@@ -228,6 +231,7 @@ protected:
     const size_t max_loading_retries;
     const std::atomic<size_t> & metadata_ref_count;
     const bool use_persistent_processing_nodes;
+    const std::string claim_owner_id;
     const std::string processing_node_path;
     const std::string processed_node_path;
     const std::string failed_node_path;
@@ -253,7 +257,8 @@ protected:
 
     static NodeMetadata createNodeMetadata(const std::string & path, const std::string & exception = {}, size_t retries = 0);
 
-    static std::string getProcessorInfo(const std::string & processor_id);
+    static std::string getProcessorInfo(
+        const std::string & processor_id, const std::string & claim_owner_id = {});
 };
 
 }

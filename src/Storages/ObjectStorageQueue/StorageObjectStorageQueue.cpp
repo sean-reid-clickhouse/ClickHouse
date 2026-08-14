@@ -506,6 +506,12 @@ void StorageObjectStorageQueue::startup()
         throw Exception(ErrorCodes::FAULT_INJECTED, "Failed to startup");
     });
 
+    files_metadata->registerClaimOwner(getStorageID());
+    SCOPE_EXIT_SAFE({
+        if (!startup_finished)
+            files_metadata->unregisterClaimOwner(getStorageID());
+    });
+
     /// Start background tasks.
     files_metadata->startup();
     for (auto & task : streaming_tasks)
@@ -552,6 +558,15 @@ void StorageObjectStorageQueue::shutdown(bool is_drop)
 
     if (files_metadata)
     {
+        try
+        {
+            files_metadata->unregisterClaimOwner(getStorageID());
+        }
+        catch (...)
+        {
+            tryLogCurrentException(log);
+        }
+
         try
         {
             files_metadata->unregisterActive(getStorageID());
@@ -642,7 +657,7 @@ void ReadFromObjectStorageQueue::createIterator(const ActionsDAG::Node * predica
     if (iterator)
         return;
 
-    iterator = storage->createFileIterator(context, predicate);
+    iterator = storage->createFileIterator(context, predicate, /* track_claim_owner */ false);
 }
 
 
@@ -819,6 +834,11 @@ void StorageObjectStorageQueue::threadFunc(size_t streaming_tasks_index)
 
         LOG_TRACE(log, "Background consumption is stopped, rescheduling next check in {} ms", paused_reschedule_period);
 
+        {
+            std::lock_guard streaming_lock(streaming_mutex);
+            streaming_file_iterator.reset();
+        }
+
         try
         {
             files_metadata->unregisterActive(storage_id);
@@ -836,6 +856,11 @@ void StorageObjectStorageQueue::threadFunc(size_t streaming_tasks_index)
         static constexpr auto disabled_streaming_reschedule_period = 5000;
 
         LOG_TRACE(log, "Streaming is disabled, rescheduling next check in {} ms", disabled_streaming_reschedule_period);
+
+        {
+            std::lock_guard streaming_lock(streaming_mutex);
+            streaming_file_iterator.reset();
+        }
 
         std::lock_guard lock(mutex);
         reschedule_processing_interval_ms = disabled_streaming_reschedule_period;
@@ -870,6 +895,9 @@ void StorageObjectStorageQueue::threadFunc(size_t streaming_tasks_index)
             else
             {
                 LOG_TEST(log, "No ready attached dependencies");
+
+                std::lock_guard streaming_lock(streaming_mutex);
+                streaming_file_iterator.reset();
             }
         }
         catch (...)
@@ -951,7 +979,7 @@ bool StorageObjectStorageQueue::streamToViews(size_t streaming_tasks_index, UInt
         std::lock_guard streaming_lock(streaming_mutex);
         if (!streaming_file_iterator || streaming_file_iterator->isFinished())
         {
-            streaming_file_iterator = createFileIterator(queue_context, nullptr);
+            streaming_file_iterator = createFileIterator(queue_context, nullptr, /* track_claim_owner */ true);
         }
         file_iterator = streaming_file_iterator;
     }
@@ -1125,6 +1153,8 @@ bool StorageObjectStorageQueue::streamToViews(size_t streaming_tasks_index, UInt
         if (stream_control.isBlocked())
             break;
     }
+
+    file_iterator->releaseFinishedBuckets();
 
     LOG_TEST(log, "Processed rows: {}, elapsed: {} ms", total_rows, watch.elapsedMilliseconds());
     return total_rows > 0;
@@ -1718,7 +1748,8 @@ const ObjectStorageQueueTableMetadata & StorageObjectStorageQueue::getTableMetad
 }
 
 std::shared_ptr<StorageObjectStorageQueue::FileIterator>
-StorageObjectStorageQueue::createFileIterator(ContextPtr local_context, const ActionsDAG::Node * predicate)
+StorageObjectStorageQueue::createFileIterator(
+    ContextPtr local_context, const ActionsDAG::Node * predicate, bool track_claim_owner)
 {
     auto component_guard = Coordination::setCurrentComponent("StorageObjectStorageQueue::createFileIterator");
 
@@ -1748,6 +1779,7 @@ StorageObjectStorageQueue::createFileIterator(ContextPtr local_context, const Ac
         log,
         enable_hash_ring_filtering_copy,
         file_deletion_enabled,
+        track_claim_owner,
         shutdown_called);
 }
 

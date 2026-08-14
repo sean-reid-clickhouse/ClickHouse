@@ -57,6 +57,7 @@ public:
             LoggerPtr logger_,
             bool enable_hash_ring_filtering_,
             bool file_deletion_on_processed_enabled_,
+            bool track_claim_owner_,
             std::atomic<bool> & shutdown_called_);
 
         bool isFinished();
@@ -95,6 +96,7 @@ public:
         const ObjectStorageQueueMode mode;
         const bool enable_hash_ring_filtering;
         const StorageID storage_id;
+        const std::string claim_owner_id;
         const bool use_buckets_for_processing;
         const size_t buckets_num = 0;
 

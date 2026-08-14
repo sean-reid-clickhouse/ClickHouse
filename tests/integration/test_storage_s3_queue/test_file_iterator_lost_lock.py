@@ -1,3 +1,4 @@
+import json
 import logging
 import time
 import uuid
@@ -215,6 +216,164 @@ def test_streaming_recovers_after_lost_bucket_lock(started_cluster):
         f"WHERE table = '{table_name}' AND status = 'Processed' "
         f"GROUP BY file_name HAVING count() > 1"
     )
+
+
+def test_reclaims_persistent_claims_after_owner_restart(started_cluster):
+    node = started_cluster.instances["instance"]
+
+    table_name = f"test_abandoned_bucket_lock_{uuid.uuid4().hex[:8]}"
+    dst_table_name = f"{table_name}_dst"
+    keeper_path = f"/clickhouse/test_{table_name}"
+    files_path = f"{table_name}_data"
+    files_to_generate = 10
+
+    create_table(
+        started_cluster,
+        node,
+        table_name,
+        "ordered",
+        files_path,
+        additional_settings={
+            "keeper_path": keeper_path,
+            "buckets": 2,
+            "processing_threads_num": 1,
+            "persistent_processing_node_ttl_seconds": 21600,
+            "cleanup_interval_min_ms": 600000,
+            "cleanup_interval_max_ms": 600000,
+            "max_processed_files_before_commit": 1,
+            "polling_min_timeout_ms": 100,
+        },
+    )
+
+    generate_random_files(
+        started_cluster, files_path, files_to_generate, start_ind=0, row_num=1
+    )
+
+    node.query(
+        f"""
+        CREATE TABLE {dst_table_name}
+        (column1 UInt32, column2 UInt32, column3 UInt32, _path String)
+        ENGINE = MergeTree ORDER BY column1
+        """
+    )
+    node.query(
+        f"""
+        CREATE MATERIALIZED VIEW {table_name}_mv TO {dst_table_name} AS
+        SELECT column1, column2, column3, _path
+        FROM {table_name}
+        WHERE ignore(sleepEachRow(2)) = 0
+        """
+    )
+
+    zk = started_cluster.get_kazoo_client("zoo1")
+    lock_path = None
+    previous_lock_data = None
+    previous_owner_id = None
+    previous_owner_path = None
+    previous_processing_data = None
+    previous_processing_path = None
+
+    for _ in range(300):
+        for bucket in range(2):
+            candidate_lock_path = f"{keeper_path}/buckets/{bucket}/lock"
+            try:
+                lock_data, _ = zk.get(candidate_lock_path)
+                lock_info = json.loads(lock_data)
+                claim_owner_id = lock_info.get("claim_owner_id")
+                if claim_owner_id:
+                    owner_path = f"{keeper_path}/claim_owners/{claim_owner_id}"
+                    if zk.exists(owner_path):
+                        for processing_node in zk.get_children(
+                            f"{keeper_path}/processing"
+                        ):
+                            processing_path = (
+                                f"{keeper_path}/processing/{processing_node}"
+                            )
+                            try:
+                                processing_data, _ = zk.get(processing_path)
+                                processing_info = json.loads(processing_data)
+                                if (
+                                    processing_info.get("claim_owner_id")
+                                    == claim_owner_id
+                                ):
+                                    lock_path = candidate_lock_path
+                                    previous_lock_data = lock_data
+                                    previous_owner_id = claim_owner_id
+                                    previous_owner_path = owner_path
+                                    previous_processing_data = processing_data
+                                    previous_processing_path = processing_path
+                                    break
+                            except NoNodeError:
+                                pass
+            except NoNodeError:
+                pass
+        if lock_path is not None:
+            break
+        time.sleep(0.1)
+
+    assert lock_path is not None
+    assert previous_lock_data is not None
+    assert previous_owner_id is not None
+    assert previous_owner_path is not None
+    assert previous_processing_data is not None
+    assert previous_processing_path is not None
+
+    node.stop_clickhouse(kill=True)
+    clickhouse_started = False
+    try:
+        for _ in range(600):
+            if not zk.exists(previous_owner_path):
+                break
+            time.sleep(0.1)
+        assert not zk.exists(previous_owner_path)
+
+        lock_data, _ = zk.get(lock_path)
+        assert lock_data == previous_lock_data
+        processing_data, _ = zk.get(previous_processing_path)
+        assert processing_data == previous_processing_data
+
+        node.start_clickhouse()
+        clickhouse_started = True
+
+        current_owner_id = None
+        for _ in range(300):
+            try:
+                owner_ids = zk.get_children(f"{keeper_path}/claim_owners")
+                current_owner_id = next(
+                    (
+                        owner_id
+                        for owner_id in owner_ids
+                        if owner_id != previous_owner_id
+                    ),
+                    None,
+                )
+                if current_owner_id:
+                    break
+            except NoNodeError:
+                pass
+            time.sleep(0.1)
+
+        assert current_owner_id is not None
+
+        def get_processed_count():
+            return int(node.query(f"SELECT uniqExact(_path) FROM {dst_table_name}"))
+
+        for _ in range(150):
+            if get_processed_count() == files_to_generate:
+                break
+            time.sleep(1)
+
+        assert get_processed_count() == files_to_generate
+        assert node.contains_in_log(f"Reclaimed stale bucket lock {lock_path}")
+        for _ in range(100):
+            if not zk.exists(previous_processing_path):
+                break
+            time.sleep(0.1)
+        with pytest.raises(NoNodeError):
+            zk.get(previous_processing_path)
+    finally:
+        if not clickhouse_started:
+            node.start_clickhouse()
 
 
 def test_lost_bucket_lock_detected_during_release(started_cluster):

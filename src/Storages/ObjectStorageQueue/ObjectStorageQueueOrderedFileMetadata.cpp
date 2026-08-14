@@ -212,6 +212,7 @@ ObjectStorageQueueOrderedFileMetadata::BucketHolder::BucketHolder(
     const Bucket & bucket_,
     const std::string & bucket_lock_path_,
     const std::string & processor_info_,
+    int32_t bucket_lock_version_,
     const std::atomic<size_t> & persistent_processing_node_ttl_seconds_,
     LoggerPtr log_,
     const std::string & zookeeper_name_)
@@ -220,6 +221,7 @@ ObjectStorageQueueOrderedFileMetadata::BucketHolder::BucketHolder(
         .bucket_lock_path = bucket_lock_path_,
         .processor_info = processor_info_,
         .zookeeper_name = zookeeper_name_ }))
+    , bucket_lock_version(bucket_lock_version_)
     , persistent_processing_node_ttl_seconds(persistent_processing_node_ttl_seconds_)
     , log(log_)
 {
@@ -413,6 +415,7 @@ ObjectStorageQueueOrderedFileMetadata::ObjectStorageQueueOrderedFileMetadata(
     size_t max_loading_retries_,
     std::atomic<size_t> & metadata_ref_count_,
     bool use_persistent_processing_nodes_,
+    const std::string & claim_owner_id_,
     const std::string & zookeeper_name_,
     ObjectStorageQueueBucketingMode bucketing_mode_,
     ObjectStorageQueuePartitioningMode partitioning_mode_,
@@ -428,6 +431,7 @@ ObjectStorageQueueOrderedFileMetadata::ObjectStorageQueueOrderedFileMetadata(
         max_loading_retries_,
         metadata_ref_count_,
         use_persistent_processing_nodes_,
+        claim_owner_id_,
         log_)
     , buckets_num(buckets_num_)
     , zk_path(zk_path_)
@@ -662,6 +666,7 @@ ObjectStorageQueueOrderedFileMetadata::getBucketForPath(
 ObjectStorageQueueOrderedFileMetadata::BucketHolderPtr ObjectStorageQueueOrderedFileMetadata::tryAcquireBucket(
     const std::filesystem::path & zk_path,
     const Bucket & bucket,
+    const std::string & claim_owner_id,
     bool /*use_persistent_processing_nodes_*/,
     const std::atomic<size_t> & persistent_processing_node_ttl_seconds_,
     const std::string & zookeeper_name_,
@@ -680,9 +685,12 @@ ObjectStorageQueueOrderedFileMetadata::BucketHolderPtr ObjectStorageQueueOrdered
 #endif
 
     const auto bucket_lock_path = bucket_path / "lock";
-    const auto processor_info = getProcessorInfo(generateProcessingID());
+    const auto processor_info = getProcessorInfo(generateProcessingID(), claim_owner_id);
+    const auto claim_owner_path = zk_path / "claim_owners" / claim_owner_id;
 
     Coordination::Error code = {};
+    int32_t bucket_lock_version = 0;
+    bool reclaimed_stale_lock = false;
     zk_retry.resetFailures();
     zk_retry.retryLoop([&]
     {
@@ -690,33 +698,86 @@ ObjectStorageQueueOrderedFileMetadata::BucketHolderPtr ObjectStorageQueueOrdered
         std::string data;
         /// If it is a retry, we could have failed after actually successfully executing the request.
         /// So here we check if we succeeded by checking `processor_info` of the processing node.
-        if (zk_retry.isRetry() && zk_client->tryGet(bucket_lock_path, data))
+        Coordination::Stat retry_stat;
+        if (zk_retry.isRetry() && zk_client->tryGet(bucket_lock_path, data, &retry_stat))
         {
             chassert(!data.empty());
             if (data == processor_info)
             {
+                bucket_lock_version = retry_stat.version;
                 LOG_TRACE(log_, "Considering operation as succeeded");
                 code = Coordination::Error::ZOK;
                 return;
             }
         }
         code = zk_client->tryCreate(bucket_lock_path, processor_info, zkutil::CreateMode::Persistent);
+        if (code != Coordination::Error::ZNODEEXISTS)
+            return;
+
+        if (claim_owner_id.empty())
+            return;
+
+        Coordination::Stat lock_stat;
+        if (!zk_client->tryGet(bucket_lock_path, data, &lock_stat))
+        {
+            code = Coordination::Error::ZNONODE;
+            return;
+        }
+
+        if (data == processor_info)
+        {
+            bucket_lock_version = lock_stat.version;
+            code = Coordination::Error::ZOK;
+            return;
+        }
+
+        Poco::JSON::Parser parser;
+        auto json = parser.parse(data).extract<Poco::JSON::Object::Ptr>();
+        const auto previous_claim_owner_id = json->optValue<std::string>("claim_owner_id", "");
+
+        /// Locks written by older versions do not carry an active owner. Keep them
+        /// until the TTL cleanup can prove they are abandoned.
+        if (previous_claim_owner_id.empty())
+            return;
+
+        Coordination::Requests requests;
+        requests.push_back(zkutil::makeCheckRequest(claim_owner_path, -1));
+        zkutil::addCheckNotExistsRequest(requests, *zk_client, zk_path / "claim_owners" / previous_claim_owner_id);
+        requests.push_back(zkutil::makeSetRequest(bucket_lock_path, processor_info, lock_stat.version));
+
+        Coordination::Responses responses;
+        code = zk_client->tryMulti(requests, responses);
+        if (code == Coordination::Error::ZOK)
+        {
+            bucket_lock_version = lock_stat.version + 1;
+            reclaimed_stale_lock = true;
+        }
     });
 
     if (code == Coordination::Error::ZOK)
     {
+        if (reclaimed_stale_lock)
+        {
+            LOG_INFO(
+                log_,
+                "Reclaimed stale bucket lock {} from inactive claim owner",
+                bucket_lock_path);
+        }
         LOG_TEST(log_, "Processor {} acquired bucket {} for processing", processor_info, bucket);
 
         return std::make_shared<BucketHolder>(
             bucket,
             bucket_lock_path,
             processor_info,
+            bucket_lock_version,
             persistent_processing_node_ttl_seconds_,
             log_,
             zookeeper_name_);
     }
 
-    if (code == Coordination::Error::ZNODEEXISTS)
+    if (code == Coordination::Error::ZNODEEXISTS
+        || code == Coordination::Error::ZNONODE
+        || code == Coordination::Error::ZBADVERSION)
         return nullptr;
 
     throw Exception(ErrorCodes::LOGICAL_ERROR, "Failed to set file processing, error: {}", code);
@@ -727,7 +788,7 @@ std::pair<bool, ObjectStorageQueueIFileMetadata::FileStatus::State> ObjectStorag
     auto zk_client = ObjectStorageQueueMetadata::getZooKeeper(log, zookeeper_name);
     auto zk_retry = ObjectStorageQueueMetadata::getKeeperRetriesControl(log);
 
-    processor_info = getProcessorInfo(generateProcessingID());
+    processor_info = getProcessorInfo(generateProcessingID(), claim_owner_id);
 
     const size_t max_num_tries = 100;
     Coordination::Error code = {};

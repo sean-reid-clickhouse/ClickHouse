@@ -19,6 +19,7 @@ ObjectStorageQueueUnorderedFileMetadata::ObjectStorageQueueUnorderedFileMetadata
     size_t max_loading_retries_,
     std::atomic<size_t> & metadata_ref_count_,
     bool use_persistent_processing_nodes_,
+    const std::string & claim_owner_id_,
     const std::string & zookeeper_name_,
     LoggerPtr log_)
     : ObjectStorageQueueIFileMetadata(
@@ -31,6 +32,7 @@ ObjectStorageQueueUnorderedFileMetadata::ObjectStorageQueueUnorderedFileMetadata
         max_loading_retries_,
         metadata_ref_count_,
         use_persistent_processing_nodes_,
+        claim_owner_id_,
         log_)
 {
     LOG_TEST(log, "Path: {}, node_name: {}, max_loading_retries: {}, "
@@ -45,7 +47,7 @@ ObjectStorageQueueUnorderedFileMetadata::prepareProcessingRequestsImpl(
     const std::string & processing_id)
 {
     auto zk_client = ObjectStorageQueueMetadata::getZooKeeper(log, zookeeper_name);
-    processor_info = getProcessorInfo(processing_id);
+    processor_info = getProcessorInfo(processing_id, claim_owner_id);
 
     SetProcessingResponseIndexes result;
 
